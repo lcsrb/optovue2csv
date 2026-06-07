@@ -1,0 +1,6 @@
+*.pdf
+*.csv
+debug*
+.claude
+.venv
+__pycache__
