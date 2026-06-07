@@ -334,6 +334,138 @@ EXPECTED_LEN = {"pachymetry": 3, "epithelium": 2}
 
 
 # --------------------------------------------------------------------------
+# Left-panel summary statistics
+# --------------------------------------------------------------------------
+# The two stat panels (Pachymetry "Offset Thickness" and Epithelium) are small
+# black-on-white numbers inside sunken 3-D input boxes — unlike the big coloured
+# map sectors, these carry a sign and (Std Dev) one decimal place. Each entry is
+# the centre (cx, cy, w, h) of one value box at 600 DPI, laid out as two 3-row x
+# 2-col grids. Validated against both reference reports.
+STAT_BOXES = {
+    "pachy_stats_sn_it": (587, 2779, 223, 79),  # SN-IT(2-5mm)
+    "pachy_stats_s_i": (1171, 2779, 223, 79),  # S-I(2-5mm)
+    "pachy_stats_min": (585, 2897, 219, 79),  # Min
+    "pachy_stats_location_y": (1171, 2897, 223, 79),  # Location Y
+    "pachy_stats_min_median": (585, 3015, 219, 79),  # Min-Median
+    "pachy_stats_min_max": (1171, 3015, 223, 79),  # Min-Max
+    "epi_stats_s": (492, 3423, 157, 79),  # S(2-5mm)
+    "epi_stats_i": (952, 3423, 158, 79),  # I(2-5mm)
+    "epi_stats_min": (492, 3542, 157, 78),  # Min
+    "epi_stats_max": (952, 3542, 158, 78),  # Max
+    "epi_stats_std_dev": (492, 3660, 157, 79),  # Std Dev
+    "epi_stats_min_max": (952, 3660, 158, 79),  # Min-Max
+}
+
+_STAT_SCALES = (3, 4, 6)
+_STAT_PSM = (6, 7, 8, 13)
+
+
+def _stat_magnitude(crop, expected_len):
+    """Vote an unsigned-integer string out of a border-free glyph crop.
+
+    Reads under several upscales, each raw and Otsu-binarised, under several psm
+    modes, then votes — reads whose length matches the blob-count estimate
+    outrank the rest, breaking the tie that a dropped/extra digit would create.
+    Returns (digits, confidence) where confidence is the winning read's share.
+    """
+    reads = []
+    for fx in _STAT_SCALES:
+        up = cv2.resize(crop, None, fx=fx, fy=fx, interpolation=cv2.INTER_LANCZOS4)
+        _, otsu = cv2.threshold(up, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        for variant in (up, otsu):
+            v = cv2.copyMakeBorder(variant, 25, 25, 25, 25, cv2.BORDER_CONSTANT, value=255)
+            for psm in _STAT_PSM:
+                txt = pytesseract.image_to_string(
+                    v, config=f"--psm {psm} -c tessedit_char_whitelist=0123456789 "
+                )
+                d = "".join(re.findall(r"\d", txt))
+                if d:
+                    reads.append(d)
+    if not reads:
+        return "", 0.0
+    right = [r for r in reads if len(r) == expected_len] or reads
+    value, n = Counter(right).most_common(1)[0]
+    return value, n / len(right)
+
+
+def read_stat_box(gray, debug_path=None):
+    """Read one signed / decimal value from a left-panel statistics box.
+
+    The value sits in a sunken 3-D box whose dark top-left bevel would survive
+    binarisation and merge into the digits. We paint the border band white
+    first, which keeps it out of the binarisation *and* severs the glyphs from
+    it — cropping the border out instead would clip the leading "-", which sits
+    hard against (and often connected to) the bevel. Then: isolate the glyph
+    blobs, OCR the digits as a magnitude, and re-attach the sign and decimal
+    point by geometry, since Tesseract drops both at this glyph size. Returns
+    (value_string, confidence); ("", 0.0) when nothing legible is found.
+    """
+    g = gray.copy()
+    f = 8
+    g[:f, :] = 255
+    g[-f:, :] = 255
+    g[:, :f] = 255
+    g[:, -f:] = 255
+    H, W = g.shape
+
+    _, mask = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Keep glyph blobs; drop speckle and any residual border line/ring (a blob
+    # spanning almost the full box width or height is leftover border, not text).
+    blobs = [
+        b
+        for b in map(cv2.boundingRect, cnts)
+        if b[2] >= 4 and b[3] >= 4 and b[2] < 0.8 * W and b[3] < 0.85 * H
+    ]
+    if not blobs:
+        return "", 0.0
+
+    max_h = max(b[3] for b in blobs)
+    digits = sorted((b for b in blobs if b[3] > 0.55 * max_h), key=lambda b: b[0])
+    small = [b for b in blobs if b[3] <= 0.55 * max_h]
+    if not digits:
+        return "", 0.0
+
+    # Expected digit count from width, not blob count: two touching digits form
+    # one blob, so "-55" must not collapse to a single "5".
+    single_w = 0.62 * max_h
+    expected_len = sum(max(1, round(b[2] / single_w)) for b in digits)
+
+    x0 = min(b[0] for b in digits)
+    x1 = max(b[0] + b[2] for b in digits)
+    y0 = min(b[1] for b in digits)
+    y1 = max(b[1] + b[3] for b in digits)
+    pad = 6
+    crop = g[max(0, y0 - pad) : y1 + pad, max(0, x0 - pad) : x1 + pad]
+    if debug_path:
+        cv2.imwrite(debug_path, crop)
+
+    value, conf = _stat_magnitude(crop, expected_len)
+    if not value:
+        return "", 0.0
+
+    # Leading minus: a wide-but-short blob sitting entirely left of the digits.
+    left_edge = digits[0][0]
+    negative = any((b[0] + b[2]) <= left_edge + 4 and b[2] > b[3] for b in small)
+    # Decimal point: a small blob near the baseline, among/after the digits.
+    dots = [
+        b
+        for b in small
+        if b[2] < 0.5 * max_h
+        and (b[1] + b[3]) > y1 - 0.25 * max_h
+        and (b[0] + b[2]) > left_edge
+    ]
+    if len(dots) == 1 and len(value) >= 2:
+        dot_x = dots[0][0] + dots[0][2] / 2
+        after = sum(1 for d in digits if (d[0] + d[2] / 2) > dot_x)
+        if 0 < after < len(value):
+            value = value[:-after] + "." + value[-after:]
+    if negative:
+        value = "-" + value
+    return value, conf
+
+
+# --------------------------------------------------------------------------
 # Patient demographics — pulled from the PDF's embedded text layer (no OCR).
 # --------------------------------------------------------------------------
 # The Optovue report header is real text (not part of the rasterised maps), so
@@ -439,6 +571,23 @@ def extract_corneal_data(pdf_path, debug_dir=None):
     gdia = cv2.cvtColor(img[dy : dy + dh, dx : dx + dw], cv2.COLOR_BGR2GRAY)
     dbg = os.path.join(debug_dir, "map_diameters_ocr.png") if debug_dir else None
     data["map_diameters"] = read_diameters(gdia, dbg)
+
+    # Left-panel summary statistics (signed / decimal black-on-white values).
+    # Same fan-out pattern as the sectors; an empty read is flagged for review.
+    def read_stat(item):
+        key, box = item
+        gray = cv2.cvtColor(_crop_center(img, box), cv2.COLOR_BGR2GRAY)
+        dbg = os.path.join(debug_dir, f"{key}_ocr.png") if debug_dir else None
+        value, _ = read_stat_box(gray, dbg)
+        return key, value
+
+    with ThreadPoolExecutor(
+        max_workers=min(len(STAT_BOXES), os.cpu_count() or 4)
+    ) as pool:
+        for key, value in pool.map(read_stat, STAT_BOXES.items()):
+            data[key] = value
+            if not value:
+                warnings.append(key)
 
     return data, warnings
 
