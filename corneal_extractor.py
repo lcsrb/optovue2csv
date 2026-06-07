@@ -24,6 +24,8 @@ import os
 os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 
 import re
+import shutil
+import subprocess
 import cv2
 import numpy as np
 import pandas as pd
@@ -332,6 +334,49 @@ EXPECTED_LEN = {"pachymetry": 3, "epithelium": 2}
 
 
 # --------------------------------------------------------------------------
+# Patient demographics — pulled from the PDF's embedded text layer (no OCR).
+# --------------------------------------------------------------------------
+# The Optovue report header is real text (not part of the rasterised maps), so
+# poppler's pdftotext reads it directly and exactly. pdf2image already pulls in
+# poppler, so pdftotext is available without adding a dependency. Each field is
+# a "Label: value" pair on the header lines; values run up to a 2+ space gap
+# (the next column) or end of line.
+PATIENT_FIELDS = {
+    "patient": "Patient",
+    "exam_date": "Exam Date",
+    "dob": r"DOB\(age\)",
+    "gender": "Gender",
+}
+
+
+def extract_patient_info(pdf_path):
+    """Return {patient, exam_date, dob, gender} from the PDF's text layer.
+
+    Uses pdftotext (poppler) rather than OCR — the header is selectable text.
+    Missing fields come back as "". The DOB column reads "29/10/1941 (79)";
+    we keep only the date and drop the parenthesised age.
+    """
+    exe = shutil.which("pdftotext")
+    if not exe:
+        return {k: "" for k in PATIENT_FIELDS}
+    text = subprocess.run(
+        [exe, "-layout", pdf_path, "-"],
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    info = {}
+    for key, label in PATIENT_FIELDS.items():
+        # value = everything after "Label:" up to a 2+ space column gap or EOL
+        m = re.search(rf"{label}:\s*(.*?)(?:\s{{2,}}|$)", text, re.MULTILINE)
+        val = m.group(1).strip() if m else ""
+        if key == "dob":
+            val = re.sub(r"\s*\(.*\)\s*$", "", val)  # strip trailing "(age)"
+        info[key] = val
+    return info
+
+
+# --------------------------------------------------------------------------
 # Extraction driver
 # --------------------------------------------------------------------------
 def _crop_center(img, box):
@@ -360,7 +405,10 @@ def extract_corneal_data(pdf_path, debug_dir=None):
     page = convert_from_path(pdf_path, dpi=DPI)[0]
     img = np.array(page)[:, :, ::-1].copy()  # PIL RGB -> OpenCV BGR
 
-    data, warnings = {"eye": read_eye(img)}, []
+    # Patient demographics from the text layer (no OCR), then the eye label.
+    data = dict(extract_patient_info(pdf_path))
+    data["eye"] = read_eye(img)
+    warnings = []
 
     # Each sector is independent and dominated by tesseract subprocess time
     # (which releases the GIL), so fan the 34 zones out across a thread pool.
