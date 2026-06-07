@@ -398,7 +398,7 @@ def extract_corneal_data(pdf_path, debug_dir=None):
 def write_csv(data, csv_path):
     """One row per zone -> CSV (matches the existing extracted_data shape)."""
     df = pd.DataFrame([{"zone": k, "value": v} for k, v in data.items()])
-    df.to_csv(csv_path, index=False)
+    df.to_csv(csv_path, sep=";", index=False)
     return csv_path
 
 
