@@ -344,7 +344,7 @@ EXPECTED_LEN = {"pachymetry": 3, "epithelium": 2}
 PATIENT_FIELDS = {
     "patient": "Patient",
     "exam_date": "Exam Date",
-    "dob": r"DOB\(age\)",
+    "DOB": r"DOB\(age\)",
     "gender": "Gender",
 }
 
@@ -370,7 +370,7 @@ def extract_patient_info(pdf_path):
         # value = everything after "Label:" up to a 2+ space column gap or EOL
         m = re.search(rf"{label}:\s*(.*?)(?:\s{{2,}}|$)", text, re.MULTILINE)
         val = m.group(1).strip() if m else ""
-        if key == "dob":
+        if key == "DOB":
             val = re.sub(r"\s*\(.*\)\s*$", "", val)  # strip trailing "(age)"
         info[key] = val
     return info

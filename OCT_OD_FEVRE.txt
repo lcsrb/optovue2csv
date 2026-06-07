@@ -1,0 +1,13 @@
+Patient: FEVRE, GUY                                                               CHNO DES 15-20           Exam Date: 31/05/2021
+Physician:                                                               28 RUE DE CHARENTON 75012 PARIS   DOB(age): 29/10/1941 (79)
+Operator:                                                                               Gender: Male       Ethnicity:
+Disease:                                                                                ID: 1571021        Algorithm Ver: A2018,1,1,63
+
+
+
+
+Report Date: lundi 31/05/2021 11:27:48   Software Version: 2018,1,1,63
+Comment:
+Signature:
+                                                                         Defining the OCT Revolution
+
