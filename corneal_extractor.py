@@ -402,11 +402,57 @@ def write_csv(data, csv_path):
     return csv_path
 
 
+def pick_pdf():
+    """Open a native file picker and return the chosen PDF path ('' if cancelled).
+
+    Uses tkinter's filedialog, which maps to the native Cocoa open panel on
+    macOS (and the native dialogs on Windows/Linux) with no extra dependency.
+    """
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()  # hide the empty root window, show only the dialog
+    root.update()
+    path = filedialog.askopenfilename(
+        title="Select an Optovue OCT report (PDF)",
+        filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+    )
+    root.destroy()
+    return path
+
+
+def pick_csv_save(default_name="corneal_data.csv"):
+    """Open a native 'Save As' picker and return the chosen path ('' if cancelled)."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.update()
+    path = filedialog.asksaveasfilename(
+        title="Save extracted data as",
+        defaultextension=".csv",
+        initialfile=default_name,
+        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+    )
+    root.destroy()
+    return path
+
+
 if __name__ == "__main__":
     import sys
 
-    pdf = sys.argv[1] if len(sys.argv) > 1 else "OCT_OD_FEVRE.pdf"
-    print("start")
+    # PDF path comes from the command line if given, otherwise from the picker.
+    if len(sys.argv) > 1:
+        pdf = sys.argv[1]
+    else:
+        pdf = pick_pdf()
+        if not pdf:
+            print("No file selected — nothing to do.")
+            sys.exit(0)
+
+    print(f"start: {pdf}")
     data, warnings = extract_corneal_data(pdf, debug_dir="debug")
     for k, v in data.items():
         print(f"{k:26s} {v}")
@@ -414,5 +460,8 @@ if __name__ == "__main__":
         print("\nFLAGGED (check debug/*_ocr.png):", ", ".join(warnings))
     else:
         print("\nAll zones passed the digit-count check.")
-    write_csv(data, "corneal_data.csv")
-    print("wrote corneal_data.csv")
+
+    out = pick_csv_save() if len(sys.argv) <= 1 else "corneal_data.csv"
+    if out:
+        write_csv(data, out)
+        print(f"wrote {out}")
