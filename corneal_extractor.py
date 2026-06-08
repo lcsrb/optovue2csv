@@ -653,9 +653,20 @@ def extract_corneal_data(pdf_path, debug_dir=None):
     return data, warnings
 
 
-def write_csv(data, csv_path):
-    """One row per zone -> CSV (matches the existing extracted_data shape)."""
-    df = pd.DataFrame([{"zone": k, "value": v} for k, v in data.items()])
+def write_csv(data, csv_path, warnings=()):
+    """One row per zone -> CSV (matches the existing extracted_data shape).
+
+    A third "review" column marks each row whose zone is in `warnings` (wrong
+    digit count, empty, or low-confidence) with "review", so flagged values are
+    visible in the file itself and can be filtered/sorted on — not just printed.
+    """
+    flagged = set(warnings)
+    df = pd.DataFrame(
+        [
+            {"zone": k, "value": v, "review": "review" if k in flagged else ""}
+            for k, v in data.items()
+        ]
+    )
     df.to_csv(csv_path, sep=";", index=False)
     return csv_path
 
@@ -721,5 +732,5 @@ if __name__ == "__main__":
 
     out = pick_csv_save() if len(sys.argv) <= 1 else "corneal_data.csv"
     if out:
-        write_csv(data, out)
+        write_csv(data, out, warnings)
         print(f"wrote {out}")
