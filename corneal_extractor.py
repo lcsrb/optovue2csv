@@ -359,6 +359,11 @@ STAT_BOXES = {
 _STAT_SCALES = (3, 4, 6)
 _STAT_PSM = (6, 7, 8, 13)
 
+# Stat reads whose winning OCR vote falls below this share are flagged for
+# review: the digits are small and JPEG-compressed, so a low-agreement read is
+# where the occasional misread hides.
+STAT_MIN_CONFIDENCE = 0.55
+
 
 def _stat_magnitude(crop, expected_len):
     """Vote an unsigned-integer string out of a border-free glyph crop.
@@ -388,6 +393,23 @@ def _stat_magnitude(crop, expected_len):
     return value, n / len(right)
 
 
+def _stat_blobs(g):
+    """Binarise a border-painted box crop and return (mask, glyph_blobs).
+
+    Glyph blobs exclude speckle and any residual border line/ring — a blob
+    spanning almost the full box width or height is leftover border, not text.
+    """
+    H, W = g.shape
+    _, mask = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    blobs = [
+        b
+        for b in map(cv2.boundingRect, cnts)
+        if b[2] >= 4 and b[3] >= 4 and b[2] < 0.8 * W and b[3] < 0.85 * H
+    ]
+    return mask, blobs
+
+
 def read_stat_box(gray, debug_path=None):
     """Read one signed / decimal value from a left-panel statistics box.
 
@@ -395,10 +417,18 @@ def read_stat_box(gray, debug_path=None):
     binarisation and merge into the digits. We paint the border band white
     first, which keeps it out of the binarisation *and* severs the glyphs from
     it — cropping the border out instead would clip the leading "-", which sits
-    hard against (and often connected to) the bevel. Then: isolate the glyph
-    blobs, OCR the digits as a magnitude, and re-attach the sign and decimal
-    point by geometry, since Tesseract drops both at this glyph size. Returns
-    (value_string, confidence); ("", 0.0) when nothing legible is found.
+    hard against (and often connected to) the bevel. Then OCR the digits as a
+    magnitude and re-attach the sign and decimal point by geometry, since
+    Tesseract drops both at this glyph size.
+
+    The minus comes in two forms. Usually it is its own blob to the left of the
+    digits. But on some exports it *overlaps* the first digit and fuses into it:
+    the leftmost digit blob then comes out too wide and starts with a stroke
+    confined to the vertical centre band. We detect that, erase just the minus
+    rows so the digit reads cleanly (an un-erased fused "-6" misreads as "5")
+    and the width-based digit count is not inflated, then re-find the blobs.
+
+    Returns (value_string, confidence); ("", 0.0) when nothing legible is found.
     """
     g = gray.copy()
     f = 8
@@ -406,31 +436,63 @@ def read_stat_box(gray, debug_path=None):
     g[-f:, :] = 255
     g[:, :f] = 255
     g[:, -f:] = 255
-    H, W = g.shape
 
-    _, mask = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    # Keep glyph blobs; drop speckle and any residual border line/ring (a blob
-    # spanning almost the full box width or height is leftover border, not text).
-    blobs = [
-        b
-        for b in map(cv2.boundingRect, cnts)
-        if b[2] >= 4 and b[3] >= 4 and b[2] < 0.8 * W and b[3] < 0.85 * H
-    ]
+    mask, blobs = _stat_blobs(g)
     if not blobs:
         return "", 0.0
-
     max_h = max(b[3] for b in blobs)
     digits = sorted((b for b in blobs if b[3] > 0.55 * max_h), key=lambda b: b[0])
     small = [b for b in blobs if b[3] <= 0.55 * max_h]
     if not digits:
         return "", 0.0
+    single_w = 0.62 * max_h  # typical single-digit width at this render
 
+    # --- sign ---
+    # Separate minus: a wide-but-short blob sitting entirely left of the digits.
+    left_edge = digits[0][0]
+    negative = any((b[0] + b[2]) <= left_edge + 4 and b[2] > b[3] for b in small)
+    # Fused minus: leftmost digit blob too wide for one digit and starting with
+    # a centre-band-only stroke. Scan within the digits' vertical span (so the
+    # frame-paint artifacts above/below are ignored), then erase the minus rows.
+    if not negative:
+        lb = digits[0]
+        yd0 = min(b[1] for b in digits)
+        yd1 = max(b[1] + b[3] for b in digits)
+        cy = (yd0 + yd1) // 2
+        band = max(3, int(0.18 * (yd1 - yd0)))
+        if lb[2] > 1.35 * single_w:
+            run, rmin, rmax = 0, yd1, yd0
+            for x in range(lb[0], lb[0] + int(1.3 * single_w)):
+                rows = np.where(mask[yd0:yd1, x] > 0)[0]
+                if rows.size == 0:
+                    if run:
+                        break
+                    continue
+                lo, hi = int(rows.min()) + yd0, int(rows.max()) + yd0
+                if lo >= cy - band and hi <= cy + band:
+                    run += 1
+                    rmin, rmax = min(rmin, lo), max(rmax, hi)
+                else:
+                    break
+            if run >= 7:
+                negative = True
+                g[rmin : rmax + 1, lb[0] : lb[0] + run + 1] = 255  # erase the minus
+                mask, blobs = _stat_blobs(g)
+                if not blobs:
+                    return "-", 0.0
+                max_h = max(b[3] for b in blobs)
+                digits = sorted(
+                    (b for b in blobs if b[3] > 0.55 * max_h), key=lambda b: b[0]
+                )
+                small = [b for b in blobs if b[3] <= 0.55 * max_h]
+                if not digits:
+                    return "-", 0.0
+                single_w = 0.62 * max_h
+
+    # --- magnitude ---
     # Expected digit count from width, not blob count: two touching digits form
     # one blob, so "-55" must not collapse to a single "5".
-    single_w = 0.62 * max_h
     expected_len = sum(max(1, round(b[2] / single_w)) for b in digits)
-
     x0 = min(b[0] for b in digits)
     x1 = max(b[0] + b[2] for b in digits)
     y0 = min(b[1] for b in digits)
@@ -442,12 +504,10 @@ def read_stat_box(gray, debug_path=None):
 
     value, conf = _stat_magnitude(crop, expected_len)
     if not value:
-        return "", 0.0
+        return ("-" if negative else ""), 0.0
 
-    # Leading minus: a wide-but-short blob sitting entirely left of the digits.
+    # --- decimal point: a small blob near the baseline, among/after digits ---
     left_edge = digits[0][0]
-    negative = any((b[0] + b[2]) <= left_edge + 4 and b[2] > b[3] for b in small)
-    # Decimal point: a small blob near the baseline, among/after the digits.
     dots = [
         b
         for b in small
@@ -573,20 +633,21 @@ def extract_corneal_data(pdf_path, debug_dir=None):
     data["map_diameters"] = read_diameters(gdia, dbg)
 
     # Left-panel summary statistics (signed / decimal black-on-white values).
-    # Same fan-out pattern as the sectors; an empty read is flagged for review.
+    # Same fan-out pattern as the sectors; an empty or low-confidence read is
+    # flagged for review.
     def read_stat(item):
         key, box = item
         gray = cv2.cvtColor(_crop_center(img, box), cv2.COLOR_BGR2GRAY)
         dbg = os.path.join(debug_dir, f"{key}_ocr.png") if debug_dir else None
-        value, _ = read_stat_box(gray, dbg)
-        return key, value
+        value, conf = read_stat_box(gray, dbg)
+        return key, value, conf
 
     with ThreadPoolExecutor(
         max_workers=min(len(STAT_BOXES), os.cpu_count() or 4)
     ) as pool:
-        for key, value in pool.map(read_stat, STAT_BOXES.items()):
+        for key, value, conf in pool.map(read_stat, STAT_BOXES.items()):
             data[key] = value
-            if not value:
+            if not value or conf < STAT_MIN_CONFIDENCE:
                 warnings.append(key)
 
     return data, warnings
